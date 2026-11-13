@@ -1,0 +1,5 @@
+# 核心依赖（版本锁死：mcp 2.x 移除了 FastMCP，裸包名会装到不兼容的新版）
+sqlite-vec==0.1.9
+fastembed==0.9.1
+# 只在用 mcp_server.py 时需要
+mcp==2.3.0
