@@ -251,29 +251,54 @@ def ingest_skills(db) -> int:
     pending = []
     for p in root.rglob("SKILL.md"):
         try:
-            head = p.read_text(errors="ignore")[:3000]
+            head = p.read_text(errors="ignore")[:12000]
         except OSError:
             continue
         m = re.match(r"---\s*\n(.*?)\n---", head, re.S)
-        name = desc = ""
+        name = desc = desc_zh = ""
         if m:
-            for line in m.group(1).splitlines():
+            lines = m.group(1).splitlines()
+            for i, line in enumerate(lines):
                 if line.startswith("name:"):
                     name = line.split(":", 1)[1].strip().strip('"\'')
+                elif line.startswith("description_zh:"):
+                    desc_zh = line.split(":", 1)[1].strip().strip('"\'')
                 elif line.startswith("description:"):
-                    desc = line.split(":", 1)[1].strip().strip('"\'')
+                    raw = line.split(":", 1)[1].strip()
+                    if raw in ("|", ">", "|-", ">-", "|+", ">+", ""):
+                        # 多行块（YAML 的 | 或 >），取后续缩进行
+                        buf = []
+                        for nxt in lines[i + 1:]:
+                            if not nxt.strip():
+                                if buf:
+                                    break
+                                continue
+                            if nxt.startswith((" ", "\t")):
+                                buf.append(nxt.strip())
+                            else:
+                                break
+                        desc = " ".join(buf)
+                    else:
+                        desc = raw.strip('"\'')
+        if not desc:
+            desc = desc_zh
         if not name:
             name = p.parent.name
         if not desc:
             continue
         rel = str(p.parent.relative_to(root))
-        content = f"技能「{name}」：{desc}"
+        content = f"技能「{name}」：{desc[:600]}"
         h = hashlib.sha1(("skill" + rel).encode()).hexdigest()
         exists = db.execute("SELECT id, content FROM memories WHERE hash=?", (h,)).fetchone()
         if exists:
-            if exists[1] != content:  # 描述改过了，更新
-                db.execute("UPDATE memories SET content=? WHERE id=?", (content, exists[0]))
-                db.execute("UPDATE mem_fts SET content=? WHERE rowid=?", (content, exists[0]))
+            if exists[1] != content:
+                # 只在「不缩短」时更新：SKILL.md 的描述可以为了省提示词 token 而精简，
+                # 但库里的完整描述要留着（召回靠它）。补充/修正（变长）照常同步。
+                if len(content) >= len(exists[1]):
+                    db.execute("UPDATE memories SET content=?, anchor=? WHERE id=?", (content, content[:100], exists[0]))
+                    db.execute("UPDATE mem_fts SET content=?, anchor=? WHERE rowid=?", (content, content[:100], exists[0]))
+                    new_vec = embed([content[:2000]])[0]
+                    db.execute("UPDATE vec SET emb=? WHERE rowid=?", (to_blob(new_vec), exists[0]))
             continue
         pending.append((content, h, rel))
 
