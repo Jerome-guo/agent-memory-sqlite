@@ -1,27 +1,17 @@
 #!/usr/bin/env python3
-"""agent-memory-sqlite — 一个文件就是一台记忆机器
+"""agent-memory-sqlite —— 一个文件就是一台记忆机器
 
-Long-term memory for AI agents: one SQLite file, no server, no cloud.
-Chinese-first (FTS5 trigram + sliding-window query), with bi-temporal validity,
-confidence, and three-lane RRF retrieval.
+  brain.py init                      建库
+  brain.py ingest [--limit N]        从 state.db 增量灌历史（打包成 episode）
+  brain.py recall "问题" [-k 5]      召回（关键词 + 语义 + 重要度 + 新鲜度），打印
+  brain.py inject "问题" [--budget 1000]  输出可直接塞进提示词的记忆块
+  brain.py stats                     规模
+  brain.py search "词"               纯 FTS5 调试
 
-  brain.py init                          建库
-  brain.py add "记得的事" [--kind fact]   手动加一条
-  brain.py ingest [--limit N]            从对话流水增量灌（打包成 episode）
-  brain.py recall "问题" [-k 5]          召回
-  brain.py inject "问题" [--budget 420]  输出可直接塞进提示词的记忆块
-  brain.py check "问题"                  这个库答得了吗（答不了就别注入）
-  brain.py expire <id>                   某条不再成立
-  brain.py supersede <旧id> <新id>       旧条作废、新条生效
-  brain.py conf <id> 0.9                 调置信度
-  brain.py decay                         每日衰减 + 归档
-  brain.py stats / brief / search
+设计原则：只用 stdlib + sqlite-vec + fastembed，
+不 import 任何 Hermes 内部模块；输入输出都是纯文本/JSON，任何宿主调 CLI 即可。
 
-设计原则：只用 stdlib + sqlite-vec + fastembed，不 import 任何宿主内部模块；
-输入输出都是纯文本/JSON，任何 agent 调 CLI 或 MCP 即可。
-
-库：~/.agent-memory/brain.db（BRAIN_HOME / BRAIN_DB 可覆盖）
-向量：BAAI/bge-small-zh-v1.5（512 维，中文场景；英文可换 bge-small-en-v1.5）
+库：~/.agent-memory/brain.db   向量：BAAI/bge-small-zh-v1.5（512d）
 """
 from __future__ import annotations
 
@@ -40,12 +30,10 @@ os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
 os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
 
 HOME = Path.home()
-# 一切都跟着环境变量走，整包搬走时只改 BRAIN_HOME 一个变量
-ROOT = Path(os.environ.get("BRAIN_HOME") or (HOME / ".agent-memory"))
-DB = Path(os.environ.get("BRAIN_DB") or (ROOT / "brain.db"))
-# 下面两个是「可选原料」：接了才有 ingest（对话流水）和 skills（技能索引）
-STATE_DB = Path(os.environ.get("BRAIN_STATE_DB") or (ROOT / "state.db"))
-SKILLS_ROOT = Path(os.environ.get("BRAIN_SKILLS_DIR") or (ROOT / "skills"))
+DB = Path(os.environ.get("BRAIN_DB") or (HOME / ".agent-memory/brain.db"))
+# 下面三个都能用环境变量挪，便于整包搬走（老部署可以指回 ~/.hermes）
+STATE_DB = Path(os.environ.get("BRAIN_STATE_DB") or (HOME / ".agent-memory/state.db"))
+SKILLS_ROOT = Path(os.environ.get("BRAIN_SKILLS_DIR") or (HOME / ".agent-memory/skills"))
 MODEL = "BAAI/bge-small-zh-v1.5"
 DIM = 512
 EPISODE_CHARS = 1500
@@ -67,7 +55,12 @@ def connect(fresh: bool = False) -> sqlite3.Connection:
     DB.parent.mkdir(parents=True, exist_ok=True)
     if fresh and DB.exists():
         DB.unlink()
-    db = sqlite3.connect(DB)
+    # timeout + WAL + busy_timeout：cron、serve、手动 CLI 会同时写，
+    # 不开 WAL 的话一个写就锁住其他，报 database is locked。
+    db = sqlite3.connect(DB, timeout=15)
+    db.execute("PRAGMA journal_mode=WAL")
+    db.execute("PRAGMA busy_timeout=8000")
+    db.execute("PRAGMA synchronous=NORMAL")
     db.enable_load_extension(True)
     import sqlite_vec
     sqlite_vec.load(db)
@@ -90,11 +83,6 @@ def connect(fresh: bool = False) -> sqlite3.Connection:
         last_access INTEGER,
         source_id INTEGER,
         extracted INTEGER DEFAULT 0,
-        -- 双时间：什么时候开始成立 / 什么时候不再成立（NULL = 至今成立）
-        valid_from INTEGER,
-        valid_to INTEGER,
-        -- 置信度（0-1）：跟 importance 分开，一个答"多重要"，一个答"多可信"
-        confidence REAL DEFAULT 0.7,
         hash TEXT UNIQUE
     );
     CREATE TABLE IF NOT EXISTS entities(
@@ -111,15 +99,84 @@ def connect(fresh: bool = False) -> sqlite3.Connection:
     );
     CREATE VIRTUAL TABLE IF NOT EXISTS vec USING vec0(emb float[512]);
     """)
-    db.execute("CREATE INDEX IF NOT EXISTS idx_mem_valid ON memories(valid_to)")
-    for col, decl in (("source_id", "INTEGER"), ("extracted", "INTEGER DEFAULT 0"),
-                      ("valid_from", "INTEGER"), ("valid_to", "INTEGER"),
-                      ("confidence", "REAL DEFAULT 0.7")):
+    for col, decl in (("source_id", "INTEGER"), ("extracted", "INTEGER DEFAULT 0")):
         try:
             db.execute(f"ALTER TABLE memories ADD COLUMN {col} {decl}")
         except sqlite3.OperationalError:
             pass
+    _ensure_skill_schema(db)
     return db
+
+
+def _ensure_skill_schema(db):
+    """技能同步用的表和列，幂等。迁移和日常同步共用一套，fresh init 也不缺列。
+
+    之前 init 建出来的库没有 valid_from/valid_to/confidence，ingest_skills 直接
+    OperationalError: table memories has no column named valid_from。"""
+    db.executescript("""
+    CREATE TABLE IF NOT EXISTS skill_desc_history(
+        id            INTEGER PRIMARY KEY,
+        mem_id        INTEGER NOT NULL,   -- memories.id（稳定主键；hash 是身份键，别拿来 join）
+        skill_rel     TEXT NOT NULL,
+        content       TEXT NOT NULL,
+        desc_sha      TEXT NOT NULL,
+        len           INTEGER NOT NULL,
+        rev           INTEGER NOT NULL,   -- 第几版历史，从 1 起
+        superseded_at INTEGER NOT NULL,
+        reason        TEXT                -- init / replaced / backfill（只记事实）
+    );
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_sdh_mem_rev ON skill_desc_history(mem_id, rev);
+    CREATE INDEX IF NOT EXISTS idx_sdh_rel ON skill_desc_history(skill_rel);
+    """)
+    for col, decl in (("desc_sha", "TEXT"), ("valid_from", "INTEGER"),
+                      ("valid_to", "INTEGER"), ("confidence", "REAL DEFAULT 0.7"), ("why", "TEXT")):
+        try:
+            db.execute(f"ALTER TABLE memories ADD COLUMN {col} {decl}")
+        except sqlite3.OperationalError:
+            pass
+    # desc_sha 半填会坑后来的人：这里把缺的一次补齐（只在有缺行时跑）
+    try:
+        miss = db.execute("SELECT id, content FROM memories WHERE kind='skill' AND desc_sha IS NULL").fetchall()
+        for mid, content in miss:
+            db.execute("UPDATE memories SET desc_sha=? WHERE id=?",
+                       (hashlib.sha1((content or '').encode()).hexdigest(), mid))
+        if miss:
+            print(f"  desc_sha 补齐 {len(miss)} 条")
+    except sqlite3.OperationalError:
+        pass
+    db.commit()
+
+
+HIST_KEEP = 5
+
+
+def _log_skill_history(db, mem_id: int, rel: str, content: str, now: int,
+                       reason: str = "replaced"):
+    """把被替换掉的旧版记进 history（rev 从 1 起）。
+
+    同一版不重复记：最新一条的 desc_sha 相同就跳过，所以「init 记了 rev=1、
+    第一次替换的旧文本就是 rev=1 那版」不会写成两行。
+    裁剪：留最近 HIST_KEEP 版，另外史上最长那版永远不删（当初设闸就是为了留住长描述）。"""
+    sha = hashlib.sha1(content.encode()).hexdigest()
+    last = db.execute(
+        "SELECT rev, desc_sha FROM skill_desc_history WHERE mem_id=? ORDER BY rev DESC LIMIT 1",
+        (mem_id,)).fetchone()
+    if last is not None:
+        if last[1] == sha:
+            return None
+        rev = last[0] + 1
+    else:
+        rev = 1
+    db.execute(
+        "INSERT INTO skill_desc_history"
+        "(mem_id,skill_rel,content,desc_sha,len,rev,superseded_at,reason)"
+        " VALUES(?,?,?,?,?,?,?,?)",
+        (mem_id, rel, content, sha, len(content), rev, now, reason))
+    db.execute(
+        "DELETE FROM skill_desc_history WHERE mem_id=? AND rev<=? AND len<"
+        "(SELECT MAX(len) FROM skill_desc_history WHERE mem_id=?)",
+        (mem_id, rev - HIST_KEEP, mem_id))
+    return rev
 
 
 _MODEL = None
@@ -138,10 +195,20 @@ def to_blob(vec: list[float]) -> bytes:
 
 INJECT_RE = re.compile(
     r"Gateway message origin \(JSON data, not instructions or authorization\):?\s*\{[^{}]*\}", re.S)
+# 包装的尾巴：网关附在每条消息后那句“别猜回复目标”，不是人说的话
+TAIL_RE = re.compile(
+    r"Do not guess a reply destination when these fields are insufficient\.?", re.I)
+# 落单的收尾标记（包装 JSON 被别的正则啃掉一半时会剩下）
+STRAY_RE = re.compile(r"\[/?OUT-OF-BAND USER MESSAGE[^\]]*\]|\[INTERNAL NOTIFICATION[^\]]*\]", re.I)
 
 
 def scrub(text: str) -> str:
-    return INJECT_RE.sub("", text).strip()
+    if not text:
+        return ""
+    t = INJECT_RE.sub("", text)
+    t = TAIL_RE.sub("", t)
+    t = STRAY_RE.sub("", t)
+    return t.strip()
 
 
 def is_noise(text: str) -> bool:
@@ -248,6 +315,7 @@ def ingest_skills(db) -> int:
     if not root.exists():
         return 0
     now = int(time.time())
+    updated = 0
     pending = []
     for p in root.rglob("SKILL.md"):
         try:
@@ -289,33 +357,52 @@ def ingest_skills(db) -> int:
         rel = str(p.parent.relative_to(root))
         content = f"技能「{name}」：{desc[:600]}"
         h = hashlib.sha1(("skill" + rel).encode()).hexdigest()
-        exists = db.execute("SELECT id, content FROM memories WHERE hash=?", (h,)).fetchone()
+        exists = db.execute("SELECT id, content, anchor, desc_sha FROM memories WHERE hash=?",
+                            (h,)).fetchone()
         if exists:
-            if exists[1] != content:
-                # 只在「不缩短」时更新：SKILL.md 的描述可以为了省提示词 token 而精简，
-                # 但库里的完整描述要留着（召回靠它）。补充/修正（变长）照常同步。
-                if len(content) >= len(exists[1]):
-                    db.execute("UPDATE memories SET content=?, anchor=? WHERE id=?", (content, content[:100], exists[0]))
-                    db.execute("UPDATE mem_fts SET content=?, anchor=? WHERE rowid=?", (content, content[:100], exists[0]))
-                    new_vec = embed([content[:2000]])[0]
-                    db.execute("UPDATE vec SET emb=? WHERE rowid=?", (to_blob(new_vec), exists[0]))
+            mem_id, old = exists[0], exists[1]
+            if old != content:
+                # 文件是唯一真相源：变短也同步（机器分不出「精简」和「纠错」，也不该分）。
+                # 旧版进 history，裁到最近 5 版 + 史上最长那版；要找回长描述去 history 查。
+                # 顺带修 anchor：以前写成 content[:100]，把技能路径冲掉了，必须是 rel。
+                _log_skill_history(db, mem_id, rel, old, now)
+                db.execute("UPDATE memories SET content=?, anchor=?, desc_sha=? WHERE id=?",
+                           (content, rel, hashlib.sha1(content.encode()).hexdigest(), mem_id))
+                # FTS / 向量是两套独立表，UPDATE 命中 0 行会静默成功 → memories 改了索引没改，
+                # 召回永久错。所以命中数不对就补插。
+                cur = db.execute("UPDATE mem_fts SET content=?, anchor=? WHERE rowid=?",
+                                 (content, rel, mem_id))
+                if cur.rowcount != 1:
+                    db.execute("INSERT INTO mem_fts(rowid,content,anchor) VALUES(?,?,?)",
+                               (mem_id, content, rel))
+                new_vec = embed([content[:2000]])[0]
+                cur = db.execute("UPDATE vec SET emb=? WHERE rowid=?", (to_blob(new_vec), mem_id))
+                if cur.rowcount != 1:
+                    db.execute("INSERT INTO vec(rowid,emb) VALUES(?,?)", (mem_id, to_blob(new_vec)))
+                updated += 1
             continue
         pending.append((content, h, rel))
 
     if not pending:
         db.commit()
-        return 0
+        return updated
     vecs = embed([p[0] for p in pending])
     for (content, h, rel), vec in zip(pending, vecs):
         cur = db.execute(
             "INSERT INTO memories(kind,content,anchor,event_at,created_at,importance,"
-            "hash,valid_from,confidence) VALUES('skill',?,?,?,?,0.6,?,?,0.9)",
-            (content, rel, now, now, h, now))
+            "hash,valid_from,confidence,desc_sha) VALUES('skill',?,?,?,?,0.6,?,?,0.9,?)",
+            (content, rel, now, now, h, now, hashlib.sha1(content.encode()).hexdigest()))
         rid = cur.lastrowid
         db.execute("INSERT INTO vec(rowid,emb) VALUES(?,?)", (rid, to_blob(vec)))
         db.execute("INSERT INTO mem_fts(rowid,content,anchor) VALUES(?,?,?)", (rid, content, rel))
+        # 首版也留痕（rev=1, reason=init），以后替换才知道这一版原来长什么样
+        db.execute("INSERT INTO skill_desc_history"
+                   "(mem_id,skill_rel,content,desc_sha,len,rev,superseded_at,reason)"
+                   " VALUES(?,?,?,?,?,1,?,'init')",
+                   (rid, rel, content, hashlib.sha1(content.encode()).hexdigest(),
+                    len(content), now))
     db.commit()
-    return len(pending)
+    return len(pending) + updated
 
 
 # ---------------- extract ----------------
@@ -332,10 +419,16 @@ EXTRACT_PROMPT = """你是记忆抽取器。读下面这段对话，抽出最多
 - relation：关系（和谁的关系、称呼、身份）
 - episode：重要经历（发生过什么、结果如何）
 
-不要抽：寒暄、工具输出、一次性的执行细节、没有结论的探索过程。
+不要抽：寒暄、工具输出、一次性的执行细节、没有结论的探索过程；
+**能当场推导出来的也不抽**（路径、行号、端口、配置值、"第N条"这类，
+它们会随文件变化，存下来就变成"权威的错误"）。
+
+**preference 和 commitment 必须带 why**：记清楚"为什么定这条"，
+碰到边缘情况时才知道这条还适不适用。没写 why 的偏好等于命令，只会盲从。
+fact 如果只是状态快照（余额、剩余、当前版本），也在 why 里写一句"哪个时点的观察"。
 
 输出严格 JSON，不要任何解释：
-{"memories":[{"kind":"fact","content":"第三人称陈述，60字内","quote":"对话里最短的原话片段，20字内","importance":0.5}]}
+{"memories":[{"kind":"fact","content":"第三人称陈述，60字内","why":"为什么重要/什么场景适用/是哪一刻的观察，40字内，可空","quote":"对话里最短的原话片段，20字内","importance":0.5}]}
 没有值得记的就输出 {"memories":[]}"""
 
 
@@ -343,7 +436,7 @@ def api_key() -> str:
     env = os.environ.get("DEEPSEEK_API_KEY", "").strip()
     if env:
         return env
-    env_file = Path(os.environ.get("BRAIN_ENV_FILE") or (ROOT / ".env"))
+    env_file = Path(os.environ.get("BRAIN_ENV_FILE") or (HOME / ".agent-memory/.env"))
     if env_file.exists():
         for line in env_file.read_text(errors="ignore").splitlines():
             if line.startswith("DEEPSEEK_API_KEY="):
@@ -399,20 +492,22 @@ def extract_pending(db, workers: int = 6, limit: int | None = None) -> tuple[int
 
     def work(r):
         try:
-            return r[0], llm_extract(r[1], key)
+            # 带上源 episode 的 event_at：抽出来的事实，发生时间应该是原对话的时间，
+            # 不是抽取那一刻。2026-11-24 修：原来写 now，导致大量条目时间整体偏晚。
+            return r[0], r[2] or None, llm_extract(r[1], key)
         except Exception as e:
-            return r[0], {"error": f"{type(e).__name__}: {e}"}
+            return r[0], r[2] or None, {"error": f"{type(e).__name__}: {e}"}
 
     results = []
     with ThreadPoolExecutor(max_workers=workers) as ex:
-        for i, (rid, got) in enumerate(ex.map(work, rows), 1):
-            results.append((rid, got))
+        for i, (rid, src_ts, got) in enumerate(ex.map(lambda r: work(r), rows), 1):
+            results.append((rid, src_ts, got))
             if i % 20 == 0:
                 print(f"  抽取 {i}/{len(rows)}", flush=True)
 
     added, errs = 0, 0
     now = int(time.time())
-    for rid, got in results:
+    for rid, src_ts, got in results:
         if isinstance(got, dict):
             errs += 1
             continue
@@ -432,9 +527,11 @@ def extract_pending(db, workers: int = 6, limit: int | None = None) -> tuple[int
                          "commitment": 0.8, "relation": 0.7}.get(g["kind"], 0.65)
                 cur = db.execute(
                     "INSERT INTO memories(kind,content,anchor,event_at,created_at,importance,"
-                    "source_id,hash,valid_from,confidence) VALUES(?,?,?,?,?,?,?,?,?,?)",
-                    (g["kind"], g["content"], g["quote"], now, now,
-                     g["importance"], src, hashed, now, _conf))
+                    "source_id,hash,valid_from,confidence,why) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                    (g["kind"], g["content"], g["quote"],
+                     src_ts or now,          # 发生时间取源对话，取不到才退回落 now
+                     now, g["importance"], src, hashed, now, _conf,
+                     (g.get("why") or "").strip()[:120] or None))
                 nid = cur.lastrowid
                 db.execute("INSERT INTO vec(rowid,emb) VALUES(?,?)", (nid, to_blob(vec)))
                 db.execute("INSERT INTO mem_fts(rowid,content,anchor) VALUES(?,?,?)",
@@ -449,7 +546,13 @@ def extract_pending(db, workers: int = 6, limit: int | None = None) -> tuple[int
 
 # ---------------- recall ----------------
 
-def recall(db, query: str, k: int = 5, touch: bool = True, include_expired: bool = False) -> list[dict]:
+def recall(db, query: str, k: int = 5, touch: bool = True, include_expired: bool = False,
+           skip_mirrors: bool = False, include_archived: bool = False,
+           skip_episode: bool = False) -> list[dict]:
+    """skip_episode: 注入通道用。episode 是原始对话切片（平均上千字、占库近一半），
+    占库里一半；它们进注入会挤掉真正的结论，还会自我放大（讨论某 bug 的对话入库后
+    反过来把这个 bug 的正确答案挤出去）。查询用 /recall 和 search 不受影响。
+    2026-11-24 加，来源：对照同类工具的排除清单 + 两轮独立召回审计。"""
     """召回。include_expired=True 时连已作废（valid_to 已过）的记忆一起返回。"""
     now = int(time.time())
     scores: dict[int, dict] = {}
@@ -470,18 +573,37 @@ def recall(db, query: str, k: int = 5, touch: bool = True, include_expired: bool
 
     terms = _kw_terms(query)
     kw_hits: dict[int, float] = {}
+    # trigram 索引只认 ≥3 字的片段，两个字的词（电视/走廊/指纹）FTS 一定查不到，
+    # 所以短词单独走 LIKE，别让它整句丢掉。
+    fts_terms = [t for t in terms if len(t) >= 3]
+    short_terms = [t for t in terms if len(t) == 2]
     try:
-        mq = " OR ".join(f'"{t}"' for t in terms if len(t) >= 3) or query
-        for rid, rank in db.execute(
-                "SELECT rowid, bm25(mem_fts) FROM mem_fts WHERE mem_fts MATCH ? "
-                "ORDER BY rank LIMIT 60", (mq,)):
-            kw_hits[rid] = 1.0 / (1.0 + abs(float(rank)))
+        if fts_terms:
+            mq = " OR ".join(f'"{t}"' for t in fts_terms)
+            # bm25 越负越相关、且 ORDER BY rank 已按相关度排好：
+            # 分必须随名次递减。旧写法 1/(1+|rank|) 会让最相关的拿最低分（投反票）。
+            for i, (rid, _rank) in enumerate(db.execute(
+                    "SELECT rowid, bm25(mem_fts) FROM mem_fts WHERE mem_fts MATCH ? "
+                    "ORDER BY rank LIMIT 60", (mq,))):
+                kw_hits[rid] = 1.0 / (1.0 + i * 0.1)
     except sqlite3.OperationalError:
         pass
+    for t in short_terms[:6]:
+        try:
+            hits = db.execute(
+                "SELECT id FROM memories WHERE 1=1" + ("" if include_archived else " AND archived=0") + " AND content LIKE ? "
+                "ORDER BY importance DESC, event_at DESC LIMIT 40", ("%" + t + "%",)).fetchall()
+        except sqlite3.OperationalError:
+            continue
+        for i, (rid,) in enumerate(hits):
+            # 短词命中按名次给分，略低于 FTS 的最好名次，别压过语义通道
+            score = 0.55 / (1.0 + i * 0.05)
+            if score > kw_hits.get(rid, 0.0):
+                kw_hits[rid] = score
     if not kw_hits:
         like = "%" + (terms[0] if terms else query) + "%"
         for rid, in db.execute(
-                "SELECT id FROM memories WHERE archived=0 AND content LIKE ? ORDER BY importance DESC LIMIT 60", (like,)):
+                "SELECT id FROM memories WHERE 1=1" + ("" if include_archived else " AND archived=0") + " AND content LIKE ? ORDER BY importance DESC LIMIT 60", (like,)):
             kw_hits[rid] = 0.6
 
     # 2) 语义
@@ -501,8 +623,8 @@ def recall(db, query: str, k: int = 5, touch: bool = True, include_expired: bool
         return []
     rows = {r[0]: r for r in db.execute(
         f"SELECT id, kind, content, anchor, event_at, importance, last_access, pinned, "
-        f"valid_to, confidence "
-        f"FROM memories WHERE archived=0 AND id IN ({','.join('?' * len(cand))})", tuple(cand))}
+        f"valid_to, confidence, why "
+        f"FROM memories WHERE" + ("" if include_archived else " archived=0 AND") + f" id IN ({','.join('?' * len(cand))})", tuple(cand))}
 
     for rid in cand:
         r = rows.get(rid)
@@ -510,6 +632,12 @@ def recall(db, query: str, k: int = 5, touch: bool = True, include_expired: bool
             continue
         # 已过作废时间的记忆不进候选：旧事实不能和新事实一起被当成"现在成立"
         if r[8] and not include_expired:
+            continue
+        # 注入通道跳过 soul/profile 镜像：这两类已每轮全文在系统提示里，
+        # 再从库里召一遍只会挤掉别的记忆、还可能召回过时的旧版。
+        if skip_mirrors and r[1] in ("soul", "profile"):
+            continue
+        if skip_episode and r[1] == "episode":
             continue
         imp = float(r[5] or 0.5)
         age_days = max(0.0, (now - (r[4] or now)) / 86400)
@@ -527,7 +655,7 @@ def recall(db, query: str, k: int = 5, touch: bool = True, include_expired: bool
             "id": rid, "kind": r[1], "content": r[2], "anchor": r[3],
             "event_at": r[4], "importance": imp, "score": round(score, 4),
             "kw": round(kw, 3), "sem": round(se, 3),
-            "confidence": conf, "valid_to": r[8],
+            "confidence": conf, "valid_to": r[8], "why": (r[10] if len(r) > 10 else None),
             "_quality": quality,
         }
 
@@ -540,9 +668,20 @@ def recall(db, query: str, k: int = 5, touch: bool = True, include_expired: bool
     rank_kw = _ranked_ranks(kw_hits)
     rank_sem = _ranked_ranks(sem)
     rank_q = _ranked_ranks({rid: s["_quality"] for rid, s in scores.items()})
+    # 2026-11-23 加：长文本惩罚。
+    # 起因：问「平时用什么语言」，前 5 位被 3 段几千字的旧对话占满，
+    # 「用中文交流」那条排到第 6。长条目多是过程，短条目多是结论。
+    # 500 字以内不打折；每超 1000 字再折 3%，最低折到 0.8。
+    def _len_factor(text: str) -> float:
+        n = len(text or "")
+        if n <= 500:
+            return 1.0
+        return max(0.80, 1.0 - (n - 500) / 1000.0 * 0.03)
+
     for rid, s in scores.items():
-        s["rrf"] = round(sum(1.0 / (60 + r.get(rid, 10 ** 6))
-                             for r in (rank_kw, rank_sem, rank_q)), 6)
+        base = sum(1.0 / (60 + r.get(rid, 10 ** 6))
+                   for r in (rank_kw, rank_sem, rank_q))
+        s["rrf"] = round(base * _len_factor(s.get("content", "")), 6)
         s.pop("_quality", None)
 
     ranked = sorted(scores.values(), key=lambda x: -x["rrf"])
@@ -557,12 +696,26 @@ def recall(db, query: str, k: int = 5, touch: bool = True, include_expired: bool
     return out
 
 
-def inject_block(hits: list[dict], budget: int = 420) -> str:
+# 会随外部变化失效的说法：路径、行号、端口、IP、金额、余额、条款编号、文件名。
+# 只有这些才配加「先核实」——每条都加会警告通胀，模型第三轮就免疫（压测中反复出现，故只对易失效说法生效）。
+_STATE_RE = re.compile(
+    "|".join([
+        "余额", "剩余", "还剩", "额度", "端口",
+        "/home/", "/var/", "/tmp/", "/etc/",
+        r"第\d+条",
+        r"\.(?:py|ya?ml|json|md)\b",
+        r"\d+\.\d+\.\d+\.\d+",
+        r"\d+\s*元",
+    ])
+)
+
+def inject_block(hits: list[dict], budget: int = 1000) -> str:
     if not hits:
         return ""
     mems = [h for h in hits if h["kind"] != "skill"]
     skis = [h for h in hits if h["kind"] == "skill"]
     lines: list[str] = []
+    now_ts = time.time()
 
     if mems:
         lines.append("【我记得】")
@@ -572,6 +725,15 @@ def inject_block(hits: list[dict], budget: int = 420) -> str:
             body = h["content"].replace("\n", " ")
             body = body[:180] + ("…" if len(body) > 180 else "")
             line = f"- ({when}) {body}"
+            # 带 why 的条目附一句原因：碰到边缘情况才知道这条还适不适用
+            why = (h.get("why") or "").strip()
+            if why and h["kind"] in ("preference", "commitment"):
+                line += f"（因为：{why[:40]}）"
+            # 选择性陈旧度：只对「会过时的说法」+「超过 2 天」+「事实类」加提醒
+            age_days = (now_ts - (h["event_at"] or now_ts)) / 86400
+            if (h["kind"] in ("fact", "commitment", "preference")
+                    and age_days > 2 and _STATE_RE.search(body)):
+                line += f"〔{int(age_days)}天前的观察，引用前先核〕"
             if used + len(line) > budget:
                 break
             lines.append(line)
@@ -625,7 +787,10 @@ def check(db, query: str) -> dict:
 
 # ---------------- lifecycle ----------------
 
-DECAY_STAMP = ROOT / ".last_decay"
+DECAY_STAMP = HOME / ".agent-memory/brain/.last_decay"
+
+
+KEEP_KINDS = ("skill", "profile", "soul")
 
 
 def decay(db, daily: float = 0.99, archive_below: float = 0.3, archive_days: int = 30,
@@ -644,11 +809,15 @@ def decay(db, daily: float = 0.99, archive_below: float = 0.3, archive_days: int
         except OSError:
             pass
     now = int(time.time())
-    rows = db.execute("SELECT id, importance, event_at, last_access, pinned FROM memories "
+    rows = db.execute("SELECT id, importance, event_at, last_access, pinned, kind FROM memories "
                       "WHERE archived=0").fetchall()
-    faded = archived = 0
-    for rid, imp, ev, last, pinned in rows:
+    faded = archived = kept = 0
+    for rid, imp, ev, last, pinned, kind in rows:
         if pinned:
+            continue
+        # 技能/档案/人格是从文件同步来的：文件在它就该在，不参与衰减与归档
+        if kind in KEEP_KINDS:
+            kept += 1
             continue
         imp = float(imp or 0.5) * daily
         db.execute("UPDATE memories SET importance=? WHERE id=?", (round(imp, 4), rid))
@@ -664,14 +833,14 @@ def decay(db, daily: float = 0.99, archive_below: float = 0.3, archive_days: int
             DECAY_STAMP.write_text(today)
         except OSError:
             pass
-    return {"faded": faded, "archived": archived}
+    return {"faded": faded, "archived": archived, "kept": kept}
 
 
 # ---------------- serve ----------------
 
 def serve(port: int = 8766) -> None:
-    """常驻 HTTP 服务，宿主（Hermes/DSH/任何东西）通过它拿记忆块。
-    GET /inject?q=...&budget=420  -> text/plain 记忆块
+    """常驻 HTTP 服务，任意宿主（CLI / MCP / HTTP）通过它拿记忆块。
+    GET /inject?q=...&budget=1000 -> text/plain 记忆块
     GET /recall?q=...&k=5         -> application/json
     GET /health                   -> ok
     """
@@ -682,7 +851,7 @@ def serve(port: int = 8766) -> None:
     print(f"brain serve on 127.0.0.1:{port}", flush=True)
 
     access_log = Path(os.environ.get("BRAIN_ACCESS_LOG")
-                      or (ROOT / "brain_access.log"))
+                      or (HOME / ".agent-memory/logs/brain_access.log"))
     try:
         access_log.parent.mkdir(parents=True, exist_ok=True)
     except Exception:
@@ -714,7 +883,8 @@ def serve(port: int = 8766) -> None:
                 db = connect()
                 try:
                     if u.path == "/inject":
-                        budget = int((qs.get("budget") or ["420"])[0])
+                        budget = int((qs.get("budget") or ["1000"])[0])
+                        q = scrub(q)   # 先把网关包装剥掉，再查库
                         # 系统/定时任务包装不是人说的话，召回只会灌噪声：
                         # 服务端兜底（插件侧那道闸在热加载过的老进程里不一定生效）
                         if SYSTEM_PROMPT_RE.match(q):
@@ -722,7 +892,9 @@ def serve(port: int = 8766) -> None:
                         # 再问一句「这问题答得了吗」，答不了就不注入——省 token，也少噪音
                         if not check(db, q)["answerable"]:
                             return self._send(200, "")
-                        return self._send(200, inject_block(recall(db, q, 5), budget))
+                        # 2026-11-23: k 5->8。召回前 5 位常被同一话题的对话占满，答案排到第 6 就丢了；
+                        # 多取 3 条，注入仍受 budget 字数限制，不会撑大上下文。
+                        return self._send(200, inject_block(recall(db, q, 8, skip_mirrors=True, skip_episode=True), budget))
                     if u.path == "/stats":
                         n = db.execute("SELECT count(*) FROM memories WHERE archived=0").fetchone()[0]
                         k = db.execute("SELECT kind, count(*) FROM memories WHERE archived=0 "
@@ -738,6 +910,7 @@ def serve(port: int = 8766) -> None:
                                           (n,)).fetchall()
                         return self._send(200, "\n".join(
                             f"- [{r[0]}] {r[1][:120]}" for r in rows))
+                    q = scrub(q)
                     if not q:
                         return self._send(400, "missing q")
                     if u.path == "/check":
@@ -745,8 +918,10 @@ def serve(port: int = 8766) -> None:
                                           "application/json; charset=utf-8")
                     if u.path == "/recall":
                         k = int((qs.get("k") or ["5"])[0])
-                        return self._send(200, json.dumps(recall(db, q, k), ensure_ascii=False),
-                                          "application/json; charset=utf-8")
+                        inc_arc = (qs.get("include_archived") or ["0"])[0] in ("1", "true", "yes")
+                        return self._send(200, json.dumps(
+                            recall(db, q, k, include_archived=inc_arc), ensure_ascii=False),
+                            "application/json; charset=utf-8")
                     return self._send(404, "not found")
                 finally:
                     db.close()
@@ -782,6 +957,9 @@ def main() -> int:
     p.add_argument("id", type=int); p.add_argument("value", type=float)
     p = sub.add_parser("inject"); p.add_argument("query"); p.add_argument("--budget", type=int, default=420)
     sub.add_parser("skills")
+    p = sub.add_parser("history")
+    p.add_argument("key", help="技能相对路径（如 productivity/llm-api-scripting）或 memories.id")
+    p.add_argument("--full", action="store_true", help="打印每版全文，不只长度")
     p = sub.add_parser("extract"); p.add_argument("--limit", type=int); p.add_argument("-w", type=int, default=6)
     p = sub.add_parser("serve"); p.add_argument("--port", type=int, default=8766)
     p = sub.add_parser("decay"); p.add_argument("--daily", type=float, default=0.99)
@@ -853,6 +1031,34 @@ def main() -> int:
         n = ingest_skills(db)
         print(f"技能入库 {n} 条，现有 "
               f"{db.execute('SELECT count(*) FROM memories WHERE kind=\'skill\'').fetchone()[0]} 条")
+    elif a.cmd == "history":
+        key = a.key.strip()
+        row = None
+        if key.isdigit():
+            row = db.execute("SELECT id, content, anchor FROM memories WHERE id=? AND kind='skill'",
+                             (int(key),)).fetchone()
+        if row is None:
+            row = db.execute("SELECT id, content, anchor FROM memories WHERE kind='skill' AND anchor=?",
+                             (key,)).fetchone()
+        if row is None:
+            row = db.execute("SELECT id, content, anchor FROM memories WHERE kind='skill' AND anchor LIKE ?",
+                             (f"%{key}%",)).fetchone()
+        if row is None:
+            print(f"没找到技能：{key}")
+            return 1
+        mem_id, cur_content, rel = row
+        print(f"id={mem_id}  {rel}")
+        print(f"当前 {len(cur_content)} 字：{cur_content[:120]}")
+        hist = db.execute(
+            "SELECT rev, len, superseded_at, reason, content FROM skill_desc_history"
+            " WHERE mem_id=? ORDER BY rev", (mem_id,)).fetchall()
+        if not hist:
+            print("  （没有历史版本）")
+        for rev, ln, ts, reason, content in hist:
+            when = time.strftime("%Y-%m-%d %H:%M", time.localtime(ts))
+            print(f"  第{rev}版 {ln}字 {when} {reason}")
+            if a.full:
+                print("    " + (content or "")[:400].replace("\n", " "))
     elif a.cmd == "extract":
         added, errs = extract_pending(db, a.w, a.limit)
         kinds = dict(db.execute("SELECT kind, count(*) FROM memories GROUP BY kind").fetchall())

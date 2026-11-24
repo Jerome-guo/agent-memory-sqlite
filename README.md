@@ -34,7 +34,7 @@ python brain.py recall "他大概在哪个时区"
 python brain.py inject "他大概在哪个时区"     # 直接能塞进提示词的一块
 ```
 
-首次运行会下载 `BAAI/bge-small-zh-v1.5`（约 100MB）。国内建议先设：
+首次运行会下载 `BAAI/bge-small-zh-v1.5`（约 100MB）。默认库在 `~/.agent-memory/brain.db`，想放别处就设 `BRAIN_DB=/你的路径/brain.db`。国内建议先设：
 
 ```bash
 export HF_ENDPOINT=https://hf-mirror.com
@@ -54,6 +54,7 @@ export HF_ENDPOINT=https://hf-mirror.com
 | `conf <id> 0.9` | 调置信度 |
 | `decay [--daily 0.99]` | 每日衰减 + 归档旧的 |
 | `stats` / `brief` / `search` | 规模 / 自我介绍 / 纯 FTS 调试 |
+| `history <技能路径或 id> [--full]` | 看这条记忆/技能的历史版本（被替换过的旧描述都在） |
 | `serve --port 8766` | 起 HTTP 服务（可选） |
 
 ## 接进你的 agent
@@ -136,6 +137,31 @@ for it in open("MEMORY.md").read().split("§"):
 **中文特化**：FTS5 `trigram` 分词 + 查询侧三字滑窗。中文没有空格，不切窗的话整句当一个 token，`MATCH` 永远 0 命中——这是中文场景最常见的坑。
 
 **注入前置检查**：`check()` 先问"这问题答得了吗"，答不了返回空字符串。不相关的问题 token 消耗归零，也不会把五条无关记忆塞进上下文。
+
+## 更新日志
+
+### 2026-11-24
+
+**修的坑（都是会让人踩到的）**
+
+- **`why` 列表没有建表语句**：老库里那列是手工 ALTER 加的，新 clone 的人 `init` 后一写 why 就报 `no such column`。现在写进 DDL。
+- **bm25 打分方向投反**：旧写法让最相关的拿最低分，等于投反票。
+- **索引漏更新静默成功**：`UPDATE ... WHERE rowid=?` 命中 0 行也算成功，改了正文而 FTS/向量没跟上，召回永久错。现在按 `rowcount` 判断并补插。
+- **并发写库报 locked**：开 WAL + `busy_timeout`，cron 和 CLI 同时写不再撞。
+- **技能 anchor 被冲掉**：原来写 `content[:100]`，把技能路径截没了。
+
+**新增的**
+
+- **`why` 字段**：偏好/承诺类记忆记「为什么定这条」，注入时附成「（因为：…）」。只存禁令，模型会在没写过的情形里判错。
+- **技能描述历史**：`skill_desc_history` 表，保留最近 5 版，另加一版是「史上最长那版」，永不删。
+- **两字词 LIKE 通道**：FTS5 trigram 只认 ≥3 个字，「电视」「走廊」这类必查不到，现在单走 LIKE。
+- **长文本惩罚**：长对话不再挤掉短结论（RRF 分按长度打折，最低 0.8）。
+- **选择性陈旧度提醒**：只对会过时的说法（路径、端口、金额、条款号）加「引用前先核」，不再每条都加，避免警告通胀。
+
+**变更**
+
+- 默认库路径改为 `~/.agent-memory/`；老部署用 `BRAIN_DB` 指回原位置即可。
+- 同步语义反转：文件是唯一真相源，内容变短也同步（机器分不清「精简」和「纠错」，宁可跟文件走）。
 
 ## 局限
 
